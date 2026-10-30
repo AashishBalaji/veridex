@@ -1,0 +1,35 @@
+# Runs the pipeline once to populate a shared volume with
+# records.csv / candidate_pairs.jsonl / metrics.json, which the
+# backend's init container waits on before the backend itself starts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: veridex-artifacts
+  namespace: veridex
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: veridex-matching
+  namespace: veridex
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: matching
+          image: veridex-matching:latest
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: veridex-artifacts

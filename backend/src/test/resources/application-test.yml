@@ -1,0 +1,13 @@
+spring:
+  datasource:
+    url: ${VERIDEX_TEST_DB_URL:jdbc:postgresql://localhost:5432/veridex_test}
+    username: ${VERIDEX_DB_USER:postgres}
+    password: ${VERIDEX_DB_PASSWORD:}
+  sql:
+    init:
+      mode: always
+
+veridex:
+  # Tests seed their own data directly through the DAOs; the loader
+  # is covered separately and shouldn't run against a missing directory.
+  artifacts-dir: ${VERIDEX_TEST_ARTIFACTS_DIR:/nonexistent}

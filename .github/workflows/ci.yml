@@ -1,0 +1,189 @@
+# Veridex CI.
+#
+# This workflow is where the pieces this sandbox's egress allowlist
+# would not let through get their real verification: Maven Central
+# and Docker Hub are both blocked in the sandbox this project was
+# built in (confirmed via direct curl -- see matching/docs or the
+# project README), so the Java backend's compile/test cycle and every
+# Docker/Kubernetes piece below have never run locally. GitHub's
+# hosted runners have full internet, so this is the actual proof that
+# all of it works, not a written-but-never-run exercise.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  matching-tests:
+    name: Matching pipeline — pytest (Spark, FAISS, classifier, explainer)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: matching
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: matching/requirements.txt
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17" # PySpark's driver JVM
+      - run: pip install -r requirements.txt
+      - name: Run tests (real Spark session, real FAISS index, real scikit-learn classifier)
+        run: python -m pytest tests/ -v
+
+  backend-tests:
+    name: Spring Boot backend — JUnit against a real Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: veridex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      VERIDEX_TEST_DB_URL: jdbc:postgresql://localhost:5432/veridex_test
+      VERIDEX_DB_USER: postgres
+      VERIDEX_DB_PASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run tests (JSONB round-trip, atomic-decision concurrency gate, union-find clustering -- against real Postgres, not a fake)
+        run: mvn -B test
+      - name: Package the jar
+        run: mvn -B -q package -DskipTests
+
+  dashboard-build:
+    name: Dashboard — typecheck & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  e2e-infra:
+    name: End-to-end — real kind cluster, real images, real HTTP smoke test
+    runs-on: ubuntu-latest
+    needs: [matching-tests, backend-tests, dashboard-build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the matching image
+        run: docker build -t veridex-matching:latest ./matching
+      - name: Build the backend image
+        run: docker build -t veridex-backend:latest ./backend
+      - name: Build the dashboard image
+        run: docker build -t veridex-dashboard:latest ./dashboard
+
+      - name: Create a real (ephemeral) Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: veridex-ci
+          wait: 120s
+
+      - name: Load images into the kind cluster
+        run: |
+          kind load docker-image veridex-matching:latest --name veridex-ci
+          kind load docker-image veridex-backend:latest --name veridex-ci
+          kind load docker-image veridex-dashboard:latest --name veridex-ci
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.31.0"
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Wait for Postgres to be ready
+        run: kubectl -n veridex rollout status statefulset/postgres --timeout=90s
+
+      - name: Wait for the matching Job to finish writing artifacts
+        run: kubectl -n veridex wait --for=condition=complete job/veridex-matching --timeout=180s
+
+      - name: Wait for the backend to be ready (its init container waits on the Job's artifacts)
+        run: kubectl -n veridex rollout status deployment/veridex-backend --timeout=120s
+
+      - name: Wait for the dashboard to be ready
+        run: kubectl -n veridex rollout status deployment/veridex-dashboard --timeout=90s
+
+      - name: Port-forward to the real running backend
+        run: |
+          kubectl -n veridex port-forward svc/veridex-backend 8080:8080 &
+          echo "PORT_FORWARD_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/api/stats && break
+            sleep 2
+          done
+
+      - name: Smoke test — the full review lifecycle, against the real deployed backend
+        run: |
+          set -euo pipefail
+
+          echo "== stats reflect the loaded artifacts =="
+          STATS=$(curl -sf http://localhost:8080/api/stats)
+          echo "$STATS"
+          echo "$STATS" | python3 -c "import sys, json; d = json.load(sys.stdin); assert d['totalRecords'] > 0; assert d['pending'] > 0"
+
+          echo "== review queue returns pending pairs with a narrative and contributions =="
+          PAIR=$(curl -sf "http://localhost:8080/api/review-queue?status=PENDING&limit=1")
+          echo "$PAIR"
+          PAIR_ID=$(echo "$PAIR" | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['id'])")
+
+          echo "== submitting a decision merges the pair =="
+          curl -sf -X POST "http://localhost:8080/api/review-queue/${PAIR_ID}/decision" \
+            -H "Content-Type: application/json" \
+            -d '{"decision": "MERGE", "reviewer": "ci-smoke-test"}' \
+            | grep -q '"status":"MERGED"'
+
+          echo "== a second decision on the same pair is rejected (the concurrency gate) =="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:8080/api/review-queue/${PAIR_ID}/decision" \
+            -H "Content-Type: application/json" \
+            -d '{"decision": "REJECT", "reviewer": "ci-smoke-test-2"}')
+          [ "$STATUS" = "409" ] || (echo "expected 409, got $STATUS" && exit 1)
+
+          echo "== cluster lookup reflects the merge =="
+          RECORD_A=$(echo "$PAIR" | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['recordA']['recordId'])")
+          curl -sf "http://localhost:8080/api/clusters/${RECORD_A}" | python3 -c "import sys, json; d = json.load(sys.stdin); assert len(d) >= 2"
+
+          echo "== all real, all green =="
+
+      - name: Stop port-forward
+        if: always()
+        run: kill "${PORT_FORWARD_PID:-0}" 2>/dev/null || true
+
+      - name: Dump pod state on failure
+        if: failure()
+        run: |
+          kubectl -n veridex get pods -o wide
+          kubectl -n veridex describe pods
+          kubectl -n veridex logs job/veridex-matching --tail=200 || true
+          kubectl -n veridex logs deployment/veridex-backend --tail=200 || true

@@ -1,0 +1,59 @@
+# Local dev stack: Postgres + the matching pipeline (one-shot, writes
+# into a shared volume) + the Spring Boot backend + the React
+# dashboard. `docker compose up --build` from the project root.
+#
+# Not verified end-to-end in this sandbox -- Docker Hub image pulls
+# are blocked by this session's egress allowlist (confirmed via
+# `docker run hello-world` returning 403). CI (full internet) is
+# where this actually gets exercised; see .github/workflows/ci.yml.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: veridex
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - veridex-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  matching:
+    build: ./matching
+    volumes:
+      - veridex-artifacts:/app/artifacts
+
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      matching:
+        condition: service_completed_successfully
+    environment:
+      VERIDEX_DB_URL: jdbc:postgresql://postgres:5432/veridex
+      VERIDEX_DB_USER: postgres
+      VERIDEX_DB_PASSWORD: postgres
+      VERIDEX_ARTIFACTS_DIR: /app/artifacts
+      VERIDEX_CORS_ORIGINS: http://localhost:5173,http://localhost:8081
+    volumes:
+      - veridex-artifacts:/app/artifacts:ro
+    ports:
+      - "8080:8080"
+
+  dashboard:
+    build: ./dashboard
+    depends_on:
+      - backend
+    ports:
+      - "8081:80"
+
+volumes:
+  veridex-pgdata:
+  veridex-artifacts:

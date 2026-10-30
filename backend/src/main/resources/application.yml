@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: veridex-backend
+  datasource:
+    url: ${VERIDEX_DB_URL:jdbc:postgresql://localhost:5432/veridex}
+    username: ${VERIDEX_DB_USER:postgres}
+    password: ${VERIDEX_DB_PASSWORD:}
+  sql:
+    init:
+      mode: always
+      continue-on-error: false
+
+server:
+  port: ${PORT:8080}
+
+veridex:
+  # Directory containing records.csv, candidate_pairs.jsonl and
+  # metrics.json written by the Python pipeline (matching/pipeline.py).
+  # Defaults to the sibling matching/artifacts/ directory in a local
+  # checkout; overridable for CI/containers where the layout differs.
+  artifacts-dir: ${VERIDEX_ARTIFACTS_DIR:../matching/artifacts}
+  cors:
+    allowed-origins: ${VERIDEX_CORS_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+
+logging:
+  level:
+    com.veridex: INFO

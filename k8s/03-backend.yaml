@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: veridex-backend
+  namespace: veridex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: veridex-backend
+  template:
+    metadata:
+      labels:
+        app: veridex-backend
+    spec:
+      # Waits for the matching Job's artifacts to actually exist
+      # before the backend (whose ArtifactLoader reads them exactly
+      # once at startup) comes up -- a plain Job-completion ordering
+      # dependency, not a readiness probe trick.
+      initContainers:
+        - name: wait-for-artifacts
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until [ -f /app/artifacts/metrics.json ]; do
+                echo "waiting for matching job to write artifacts..."
+                sleep 2
+              done
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+      containers:
+        - name: backend
+          image: veridex-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: veridex-db-credentials
+          env:
+            - name: VERIDEX_DB_URL
+              value: jdbc:postgresql://postgres:5432/veridex
+            - name: VERIDEX_DB_USER
+              value: postgres
+            - name: VERIDEX_DB_PASSWORD
+              value: postgres
+            - name: VERIDEX_ARTIFACTS_DIR
+              value: /app/artifacts
+            - name: VERIDEX_CORS_ORIGINS
+              value: "*"
+          volumeMounts:
+            - name: artifacts
+              mountPath: /app/artifacts
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /api/stats
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: veridex-artifacts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: veridex-backend
+  namespace: veridex
+spec:
+  selector:
+    app: veridex-backend
+  ports:
+    - port: 8080
+      targetPort: 8080

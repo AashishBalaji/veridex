@@ -37,7 +37,8 @@
     <dependency>
       <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
-      <scope>runtime</scope>
+      <!-- compile scope, not the usual runtime-only: CandidatePairDao
+           uses org.postgresql.util.PGobject directly to write JSONB. -->
     </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.datatype</groupId>
